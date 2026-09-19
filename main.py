@@ -52,6 +52,10 @@ class AdminFlow(StatesGroup):
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
+    # Если пользователь запустил /start посреди какого-то сценария
+    # (регистрация, жалоба и т.п.), сбрасываем застрявшее состояние.
+    await state.clear()
+
     if db.is_banned(message.from_user.id):
         await message.answer("⛔️ Вы заблокированы в этом боте.")
         return
@@ -72,7 +76,11 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.message(Registration.name)
 async def reg_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text.strip()[:50])
+    name = (message.text or "").strip()[:50]
+    if not name:
+        await message.answer("Имя не может быть пустым. Как вас зовут?")
+        return
+    await state.update_data(name=name)
     await state.set_state(Registration.age)
     await message.answer(f"Сколько вам лет? (от {MIN_AGE} до {MAX_AGE})")
 
@@ -227,11 +235,22 @@ async def browse(message: Message):
     await send_next_profile(message, message.from_user.id)
 
 
+def _match_text(name: str, username: str | None) -> str:
+    text = f"🎉 Взаимная симпатия! У вас мэтч с {name}."
+    if username:
+        text += f"\nМожете написать: @{username}"
+    return text
+
+
 @router.callback_query(F.data.startswith("react:"))
 async def on_react(callback: CallbackQuery):
+    viewer_id = callback.from_user.id
+    if db.is_banned(viewer_id):
+        await callback.answer("⛔️ Вы заблокированы.", show_alert=True)
+        return
+
     _, reaction, target_id_str = callback.data.split(":")
     target_id = int(target_id_str)
-    viewer_id = callback.from_user.id
 
     is_match = db.add_reaction(viewer_id, target_id, reaction)
 
@@ -240,22 +259,15 @@ async def on_react(callback: CallbackQuery):
     if reaction == "like" and is_match:
         viewer = db.get_user(viewer_id)
         target = db.get_user(target_id)
-        await callback.message.answer(
-            f"🎉 Взаимная симпатия! У вас мэтч с {target['name']}.\n"
-            f"Можете написать: @{target['username']}" if target["username"] else
-            f"🎉 Взаимная симпатия! У вас мэтч с {target['name']}."
-        )
+        await callback.message.answer(_match_text(target["name"], target["username"]))
         try:
             await callback.bot.send_message(
-                target_id,
-                f"🎉 Взаимная симпатия! У вас мэтч с {viewer['name']}.\n" +
-                (f"Можете написать: @{viewer['username']}" if viewer["username"] else "")
+                target_id, _match_text(viewer["name"], viewer["username"])
             )
         except Exception:
             pass
     elif reaction == "like":
         try:
-            liked_user = db.get_user(target_id)
             await callback.bot.send_message(
                 target_id,
                 "❤️ Кто-то поставил вам лайк! Загляните в раздел «Смотреть анкеты», "
@@ -272,6 +284,9 @@ async def on_react(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("report:"))
 async def on_report_start(callback: CallbackQuery, state: FSMContext):
+    if db.is_banned(callback.from_user.id):
+        await callback.answer("⛔️ Вы заблокированы.", show_alert=True)
+        return
     target_id = int(callback.data.split(":")[1])
     await state.update_data(report_target=target_id)
     await state.set_state(ReportFlow.reason)
